@@ -42,7 +42,7 @@ public class WasteStock extends BaseEntity {
     /** 拆分出的子批指向被拆的父批。 */
     private Long parentBatchId;
 
-    /** 工厂方法：新入库（默认桶装，落在库状态，记入库时刻）。 */
+    /** 工厂方法：新入库（包装缺省桶装，落在库状态，记入库时刻）。 */
     public static WasteStock inbound(Long sourceId, String categoryCode, BigDecimal weightKg, String packageType) {
         if (sourceId == null) {
             throw new BizException("产废单位不能为空");
@@ -53,13 +53,31 @@ public class WasteStock extends BaseEntity {
         if (weightKg == null || weightKg.signum() <= 0) {
             throw new BizException("入库重量必须大于 0");
         }
+        String pkg = (packageType == null || packageType.isBlank())
+                ? PackageType.DRUM.name() : packageType.trim().toUpperCase();
+        if (!PackageType.isValid(pkg)) {
+            throw new BizException("包装方式不合法，仅支持 DRUM 桶装 / BAG 袋装 / TANK 罐装 / BULK 散装");
+        }
         WasteStock stock = new WasteStock();
         stock.setSourceId(sourceId);
         stock.setCategoryCode(categoryCode.trim());
         stock.setWeightKg(weightKg);
-        stock.setPackageType((packageType == null || packageType.isBlank()) ? "DRUM" : packageType.trim());
+        stock.setPackageType(pkg);
         stock.setStatus(StockStatus.IN_STOCK);
         stock.setInAt(LocalDateTime.now());
         return stock;
+    }
+
+    /**
+     * 拆分 / 合并前的可操作校验：必须在库，且未被联单占住。
+     * 已转出、已处置、已作废（拆过并过）的批次一律挡回 —— 重复点也不会再动一次。
+     */
+    public void assertOperatable(String action) {
+        if (status != StockStatus.IN_STOCK) {
+            throw new BizException("批次 " + batchNo + " 当前不在库（" + status + "），不能" + action);
+        }
+        if (manifestId != null) {
+            throw new BizException("批次 " + batchNo + " 已被联单占用，不能" + action);
+        }
     }
 }

@@ -31,6 +31,10 @@ public final class WasteStockVoConverter {
                 domain.getCreateTime());
     }
 
+    public static List<WasteStockVO> toVoList(List<WasteStock> domains) {
+        return domains.stream().map(WasteStockVoConverter::toVo).collect(Collectors.toList());
+    }
+
     public static PageVO<WasteStockVO> toPageVo(PageResult<WasteStock> page) {
         List<WasteStockVO> content = page.content().stream()
                 .map(WasteStockVoConverter::toVo)
