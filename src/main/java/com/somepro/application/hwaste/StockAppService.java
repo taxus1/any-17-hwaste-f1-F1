@@ -1,17 +1,26 @@
 package com.somepro.application.hwaste;
 
 import com.somepro.common.exception.BizException;
+import com.somepro.domain.hwaste.model.SplitItem;
 import com.somepro.domain.hwaste.model.WasteStock;
 import com.somepro.domain.hwaste.repository.StockCheckRepository;
+import com.somepro.domain.hwaste.repository.WasteCategoryRepository;
+import com.somepro.domain.hwaste.repository.WasteSourceRepository;
 import com.somepro.domain.hwaste.repository.WasteStockRepository;
 import com.somepro.domain.shared.model.PageResult;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * 入库 / 转出用例编排（应用层）。
+ * 入库 / 转出 / 拆分 / 合并用例编排（应用层）。
+ *
+ * 入库看两头：产废单位处在正常（ACTIVE）、危废类别处在启用（ENABLED）才让登，
+ * 不存在或停用的单位 / 类别都挡回去。
  *
  * 盘点冻结规则：该单位该类别一旦有单子进到盘点中（COUNTING / PENDING_APPROVAL / APPROVED），
  * 新入库与联单转出都先停下来，等调完账或作废再放行；没在盘点中的组合照常放行。
@@ -21,17 +30,33 @@ public class StockAppService {
 
     private final WasteStockRepository wasteStockRepository;
     private final StockCheckRepository stockCheckRepository;
+    private final WasteSourceRepository wasteSourceRepository;
+    private final WasteCategoryRepository wasteCategoryRepository;
 
-    public StockAppService(WasteStockRepository wasteStockRepository, StockCheckRepository stockCheckRepository) {
+    public StockAppService(WasteStockRepository wasteStockRepository, StockCheckRepository stockCheckRepository,
+                           WasteSourceRepository wasteSourceRepository,
+                           WasteCategoryRepository wasteCategoryRepository) {
         this.wasteStockRepository = wasteStockRepository;
         this.stockCheckRepository = stockCheckRepository;
+        this.wasteSourceRepository = wasteSourceRepository;
+        this.wasteCategoryRepository = wasteCategoryRepository;
     }
 
-    /** 新入库：盘点冻结中的组合先挡回。 */
+    /** 新入库：单位 / 类别状态先校验，盘点冻结中的组合再挡回。 */
     public Mono<WasteStock> inbound(Long sourceId, String categoryCode, BigDecimal weightKg, String packageType) {
         return Mono.defer(() -> {
             WasteStock stock = WasteStock.inbound(sourceId, categoryCode, weightKg, packageType);
-            return rejectIfFrozen(stock.getSourceId(), stock.getCategoryCode(), "新入库")
+            return wasteSourceRepository.findById(stock.getSourceId())
+                    .switchIfEmpty(Mono.error(new BizException("产废单位不存在")))
+                    .flatMap(source -> source.isActive()
+                            ? Mono.empty()
+                            : Mono.error(new BizException("产废单位非正常状态，禁止入库")))
+                    .then(wasteCategoryRepository.findByCode(stock.getCategoryCode()))
+                    .switchIfEmpty(Mono.error(new BizException("危废类别不存在")))
+                    .flatMap(category -> category.isEnabled()
+                            ? Mono.empty()
+                            : Mono.error(new BizException("危废类别已停用，禁止入库")))
+                    .then(rejectIfFrozen(stock.getSourceId(), stock.getCategoryCode(), "新入库"))
                     .then(wasteStockRepository.inbound(stock));
         });
     }
@@ -53,6 +78,43 @@ public class StockAppService {
         });
     }
 
+    /**
+     * 拆分：把一个在库批次按重量拆成若干子批。packageTypes 与 weights 按下标一一对应，
+     * 不传或某项为空表示继承父批包装。重复拆同一批是幂等空操作（回现有子批）。
+     */
+    public Mono<List<WasteStock>> split(Long batchId, List<BigDecimal> weights, List<String> packageTypes) {
+        return Mono.defer(() -> {
+            if (batchId == null) {
+                return Mono.error(new BizException("批次 id 不能为空"));
+            }
+            if (weights == null || weights.isEmpty()) {
+                return Mono.error(new BizException("拆分重量列表不能为空"));
+            }
+            boolean withPackages = packageTypes != null && !packageTypes.isEmpty();
+            if (withPackages && packageTypes.size() != weights.size()) {
+                return Mono.error(new BizException("包装方式列表与重量列表数量不一致"));
+            }
+            List<SplitItem> items = new ArrayList<>();
+            for (int i = 0; i < weights.size(); i++) {
+                items.add(new SplitItem(weights.get(i), withPackages ? packageTypes.get(i) : null));
+            }
+            return wasteStockRepository.split(batchId, items);
+        });
+    }
+
+    /**
+     * 合并：把同单位、同类别、同包装的若干在库批次并成一票。
+     * 重复并同一批是幂等空操作（返回空）。
+     */
+    public Mono<WasteStock> merge(List<Long> batchIds) {
+        return Mono.defer(() -> {
+            if (batchIds == null || batchIds.isEmpty()) {
+                return Mono.error(new BizException("批次 id 列表不能为空"));
+            }
+            return wasteStockRepository.merge(batchIds);
+        });
+    }
+
     /** 该单位该类别当前在库重量合计。 */
     public Mono<BigDecimal> sumInStock(Long sourceId, String categoryCode) {
         return Mono.defer(() -> {
@@ -67,8 +129,10 @@ public class StockAppService {
     }
 
     public Mono<PageResult<WasteStock>> page(int pageNum, int pageSize, Long sourceId, String categoryCode,
-                                             String status) {
-        return wasteStockRepository.page(pageNum, pageSize, sourceId, categoryCode, status);
+                                             String packageType, String status,
+                                             LocalDate inDateFrom, LocalDate inDateTo) {
+        return wasteStockRepository.page(pageNum, pageSize, sourceId, categoryCode, packageType, status,
+                inDateFrom, inDateTo);
     }
 
     /** 盘点冻结校验：该单位该类别有盘点中的单子就挡回。 */

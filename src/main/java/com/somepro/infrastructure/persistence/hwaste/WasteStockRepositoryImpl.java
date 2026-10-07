@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.github.pagehelper.PageHelper;
 import com.somepro.common.exception.BizException;
+import com.somepro.domain.hwaste.model.SplitItem;
 import com.somepro.domain.hwaste.model.StockStatus;
 import com.somepro.domain.hwaste.model.WasteStock;
 import com.somepro.domain.hwaste.repository.WasteStockRepository;
@@ -18,14 +19,17 @@ import org.springframework.transaction.support.TransactionTemplate;
 import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.stream.Collectors;
 
 /**
  * 入库批次仓储适配器（基础设施层）。
  *
- * 入库与转出共用一把 WB 锁：批次号「取号 + 落库」串行，转出整段 FIFO 消化也串行，
- * 避免并发转出把同一批库存消化两遍。
+ * 入库、转出、拆分、合并共用一把 WB 锁：批次号「取号 + 落库」串行，
+ * 转出 FIFO 消化与拆并的「读状态 → 改写」整段也串行 —— 两个线程同时拆同一批时，
+ * 后到的在锁里重读状态，看到父批已 VOID 就走幂等空操作，不会把一批货拆出两份账。
+ * 库表 uk_batch_no 唯一约束是最后兜底。
  */
 @Repository
 public class WasteStockRepositoryImpl extends BaseBlockingRepository implements WasteStockRepository {
@@ -101,8 +105,73 @@ public class WasteStockRepositoryImpl extends BaseBlockingRepository implements 
     }
 
     @Override
+    public Mono<List<WasteStock>> split(Long batchId, List<SplitItem> items) {
+        return blocking(() -> bizNoService.inLock("WB", () -> txTemplate.execute(tx -> {
+            WasteStockPO parent = wasteStockMapper.selectById(batchId);
+            if (parent == null) {
+                throw new BizException("批次不存在");
+            }
+            if (StockStatus.VOID.name().equals(parent.getStatus())) {
+                // 已拆过 / 并过：幂等，直接回现有子批，不再重复拆
+                return listChildren(parent.getId());
+            }
+            // 状态与合计校验在领域行为里：已转出 / 已处置 / 被联单占住、合计对不上都会挡回
+            List<WasteStock> children = WasteStockPoConverter.toDomain(parent).split(items);
+            for (WasteStock child : children) {
+                WasteStockPO childPo = WasteStockPoConverter.toPo(child);
+                childPo.setId(IdUtil.getSnowflakeNextId());
+                childPo.setBatchNo(bizNoService.nextBatchNo());
+                wasteStockMapper.insert(childPo);
+                child.setId(childPo.getId());
+                child.setBatchNo(childPo.getBatchNo());
+            }
+            // 父批退出在库账，原记录保留可追溯
+            WasteStockPO update = new WasteStockPO();
+            update.setId(parent.getId());
+            update.setStatus(StockStatus.VOID.name());
+            wasteStockMapper.updateById(update);
+            return children;
+        })));
+    }
+
+    @Override
+    public Mono<WasteStock> merge(List<Long> batchIds) {
+        return blocking(() -> bizNoService.inLock("WB", () -> txTemplate.execute(tx -> {
+            List<Long> ids = batchIds.stream().distinct().collect(Collectors.toList());
+            List<WasteStockPO> rows = wasteStockMapper.selectBatchIds(ids);
+            if (rows.size() != ids.size()) {
+                throw new BizException("批次不存在或已删除");
+            }
+            // 已并过 / 拆过的批次（VOID）跳过；剩下的在库批次不足两个时没什么可并，幂等空操作
+            List<WasteStock> candidates = rows.stream()
+                    .filter(po -> !StockStatus.VOID.name().equals(po.getStatus()))
+                    .map(WasteStockPoConverter::toDomain)
+                    .collect(Collectors.toList());
+            if (candidates.size() < 2) {
+                return null;
+            }
+            // 硬杠子在领域行为里：已转出 / 已处置 / 被联单占住、非同单位同类别同包装都会挡回
+            WasteStock merged = WasteStock.mergeOf(candidates);
+            for (WasteStock candidate : candidates) {
+                WasteStockPO update = new WasteStockPO();
+                update.setId(candidate.getId());
+                update.setStatus(StockStatus.VOID.name());
+                wasteStockMapper.updateById(update);
+            }
+            WasteStockPO mergedPo = WasteStockPoConverter.toPo(merged);
+            mergedPo.setId(IdUtil.getSnowflakeNextId());
+            mergedPo.setBatchNo(bizNoService.nextBatchNo());
+            wasteStockMapper.insert(mergedPo);
+            merged.setId(mergedPo.getId());
+            merged.setBatchNo(mergedPo.getBatchNo());
+            return merged;
+        })));
+    }
+
+    @Override
     public Mono<PageResult<WasteStock>> page(int pageNum, int pageSize, Long sourceId, String categoryCode,
-                                             String status) {
+                                             String packageType, String status,
+                                             LocalDate inDateFrom, LocalDate inDateTo) {
         return this.<PageResult<WasteStock>>blocking(() -> {
             try {
                 PageHelper.startPage(pageNum, pageSize);
@@ -110,7 +179,13 @@ public class WasteStockRepositoryImpl extends BaseBlockingRepository implements 
                         .eq(sourceId != null, WasteStockPO::getSourceId, sourceId)
                         .eq(categoryCode != null && !categoryCode.isBlank(),
                                 WasteStockPO::getCategoryCode, categoryCode)
+                        .eq(packageType != null && !packageType.isBlank(),
+                                WasteStockPO::getPackageType, packageType)
                         .eq(status != null && !status.isBlank(), WasteStockPO::getStatus, status)
+                        .ge(inDateFrom != null, WasteStockPO::getInAt,
+                                inDateFrom == null ? null : inDateFrom.atStartOfDay())
+                        .lt(inDateTo != null, WasteStockPO::getInAt,
+                                inDateTo == null ? null : inDateTo.plusDays(1).atStartOfDay())
                         .orderByDesc(WasteStockPO::getId);
                 List<WasteStockPO> rows = wasteStockMapper.selectList(wrapper);
                 long total = rows instanceof com.github.pagehelper.Page
@@ -139,5 +214,15 @@ public class WasteStockRepositoryImpl extends BaseBlockingRepository implements 
         child.setStatus(status.name());
         child.setParentBatchId(parent.getId());
         wasteStockMapper.insert(child);
+    }
+
+    /** 某父批拆出的全部子批（幂等重查用）。 */
+    private List<WasteStock> listChildren(Long parentId) {
+        return wasteStockMapper.selectList(Wrappers.<WasteStockPO>lambdaQuery()
+                        .eq(WasteStockPO::getParentBatchId, parentId)
+                        .orderByAsc(WasteStockPO::getId))
+                .stream()
+                .map(WasteStockPoConverter::toDomain)
+                .collect(Collectors.toList());
     }
 }
